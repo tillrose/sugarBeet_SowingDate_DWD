@@ -1,0 +1,662 @@
+---
+title: "Extract temporal and spatial patterns from DWD phenology observers"
+format: html
+editor: source
+---
+
+```{r setup}
+
+library("tidyverse")
+library("sf")
+library("rnaturalearth")
+library("lme4")
+library("lmerTest")
+
+```
+
+```{r}
+
+```
+
+```{r import}
+
+sugarbeet.phenology_dat <- read_delim("https://opendata.dwd.de/climate_environment/CDC/observations_germany/phenology/annual_reporters/crops/historical/PH_Jahresmelder_Landwirtschaft_Kulturpflanze_Zucker-Ruebe_1925_2024_hist.txt", trim_ws = TRUE)
+
+code_list <- read_csv2("https://opendata.dwd.de/climate_environment/CDC/help/PH_Beschreibung_Phase.txt", locale = locale(encoding = "latin1"))
+
+location_list <- read_delim("https://opendata.dwd.de/climate_environment/CDC/observations_germany/phenology/annual_reporters/farming/historical/PH_Beschreibung_Phaenologie_Stationen_Jahresmelder.txt", locale = locale(encoding = "latin1", decimal_mark = ".", grouping_mark = ","), delim = ";")
+
+germany_sf <- ne_countries(scale = "medium", returnclass = "sf", country = "Germany", type = "map_units")
+bundeslaender_sf <- ne_states(country = "Germany", returnclass = "sf")
+
+```
+
+```{r tidy}
+
+bundeslaender_sf <- bundeslaender_sf |> 
+  dplyr::select("regional_state" = name) |> 
+  st_transform(crs = 4326)
+
+code_list <- code_list |> 
+  dplyr::select("Phase_id" = Phase_ID, Phase_englisch)
+
+location_list <- location_list |> 
+  dplyr::select(Stations_id, geograph.Breite, geograph.Laenge) |> 
+  mutate(Stations_id = as.double(Stations_id),
+         geograph.Breite = as.double(geograph.Breite),
+         geograph.Laenge = as.double(geograph.Laenge))
+
+sugarbeet.phenology_dat <- sugarbeet.phenology_dat |> 
+  left_join(code_list) |> 
+  filter(Phase_englisch == "beginning of tilling sowing drilling") |> 
+  dplyr::select(Stations_id, Referenzjahr, Eintrittsdatum) |> 
+  mutate(Eintrittsdatum = ymd(Eintrittsdatum)) |> 
+  left_join(location_list) |> 
+  drop_na() |> 
+  group_by(Stations_id) |> 
+    mutate("Messjahre" = n()) |> 
+  ungroup()
+
+sugarbeet.phenology_sf <- st_as_sf(sugarbeet.phenology_dat, coords = c("geograph.Laenge", "geograph.Breite"), crs = 4326)  
+
+# Aggregation of small regional states to get a robust spatial scale
+sugarbeet.phenology_sf <- sugarbeet.phenology_sf |> 
+  st_join(bundeslaender_sf) |> 
+  mutate(regional_state = case_when(regional_state %in% c("Schleswig-Holstein", "Hamburg") ~ "Schleswig-Holstein und Hamburg",
+                                    regional_state %in% c("Niedersachsen", "Bremen") ~ "Niedersachsen und Bremen",
+                                    regional_state %in% c("Brandenburg", "Berlin") ~ "Brandenburg und Berlin",
+                                    regional_state %in% c("Rheinland-Pfalz", "Saarland") ~ "Rheinland-Pfalz und Saarland",
+                                    TRUE ~ regional_state))
+
+```
+
+```{r SowingDate_Data, fig.asp=1}
+
+illu_points <- sugarbeet.phenology_sf  |> 
+  st_transform(crs = 25832) |> 
+  mutate(recent = ifelse(Referenzjahr == 2025, "Yes", "No"))
+
+plot_ <- ggplot(illu_points) + 
+  theme_minimal(base_size = 13) +
+  theme(text = element_text(family = "Helvetica Neue"),
+        legend.background = element_blank(),
+        legend.position = c(0, 1),
+        legend.justification = c(0, 1),
+        legend.spacing.y = unit(0, "lines")) +
+  geom_sf(data = germany_sf) +
+  geom_sf(aes(fill = Referenzjahr, size = recent), shape = 21, stroke = 0.1) +
+  scale_fill_viridis_c(option = "turbo") +
+  scale_size_manual(values = c(2, 4)) +
+  labs(fill = "Observation year",
+       size = "Recent observation (2025)",
+       caption = "Deutscher Wetterdienst (DWD), Climate Data Center (CDC):
+                             Phenological observations of crops from sowing to harvest
+                             (annual reporters, historical), Version v010, 2024.
+                             
+    Till Rose",
+       title = "Seven decades of sowing date observations\nin sugar beet") + 
+  coord_sf(
+    xlim = st_bbox(illu_points)[c("xmin", "xmax")] + c(-140000, 10000),
+    ylim = st_bbox(illu_points)[c("ymin", "ymax")] + c(-65000, 90000),
+    expand = FALSE
+  ) +
+  guides(size = guide_legend(order = 1)) +
+  NULL
+
+plot_
+
+```
+
+
+```{r SowingDate_Trend, fig.width = 5, fig.height=7}
+
+illu <- sugarbeet.phenology_sf |> 
+  sf::`st_geometry<-`(NULL) |> 
+  mutate(doy = lubridate::yday(Eintrittsdatum)) |> 
+  filter(doy > 30,
+         doy < 155,
+         Referenzjahr > 1950,
+         Referenzjahr <= 2025) |> 
+  mutate(Stations_id = factor(Stations_id)) |> 
+  drop_na(regional_state) |> 
+  # Centered year: with only 12 regions, letting regional_state have a
+  # random slope on raw Referenzjahr (~1950-2025) makes the region-level
+  # intercept variance numerically unstable (it's extrapolated to year 0).
+  # Centering fixes this. It's also used *inside* the spline (instead of
+  # raw Referenzjahr) so bs() and the random slope refer to literally the
+  # same variable -- using two different transforms of "year" in the same
+  # formula previously confused ggpredict()'s handling of the interaction.
+  mutate(year_c = Referenzjahr - 1987)
+
+model_lmm <- lmer(
+  doy ~ splines::bs(year_c, df = 5) + (1 + year_c | regional_state) + (1 | Stations_id),
+  data = illu,
+  REML = TRUE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+
+summary(model_lmm)
+
+# Fixed-effect (population-level, shared shape) trend with confidence interval
+fixed_trend <- tidy(model_lmm, effects = "fixed", conf.int = TRUE)
+fixed_trend
+
+# Overall (population-level) predicted trend: just the fixed spline shape,
+# with every random effect (region and station) held out via re.form = NA
+# -- i.e. no regional_state grouping, unlike the BLUPs used further down in
+# SowingDate_Trend_Diagnostics.
+pred_trend <- data.frame(
+  year_c = seq(min(illu$year_c), max(illu$year_c), by = 1)
+)
+pred_trend$predicted <- predict(model_lmm, newdata = pred_trend, re.form = NA)
+pred_trend$Referenzjahr <- pred_trend$year_c + 1987
+
+plot_ <- ggplot() +
+  theme_bw(base_size = 15) +
+  theme(text = element_text(family = "Helvetica Neue"),
+        legend.background = element_blank(),
+        legend.position = "bottom",
+        panel.grid = element_blank()) +
+  geom_point(data = illu, aes(x = Referenzjahr, y = doy), alpha = 0.06, stroke = 0.2, shape = 21, fill = "grey") +
+  geom_line(
+    data = pred_trend,
+    aes(x = Referenzjahr, y = predicted),
+    colour = "blue",
+    linewidth = 1
+  ) +
+  labs(
+    x = "Year", y = "Sowing date (day of year)",
+    title = "Overall sowing date trend",
+    caption = "Deutscher Wetterdienst (DWD), Climate Data Center (CDC):
+                             Phenological observations of crops from sowing to harvest
+                             (annual reporters, historical), Version v010, 2024.
+                             
+    Till Rose"
+  ) +
+  scale_x_continuous(expand = expansion(add = c(1, 1))) +
+  NULL
+
+plot_
+
+
+```
+
+```{r SowingDate_Germany_RandomIntercept_and_StateEffect}
+
+
+year_c_2023 <- 2023 - 1987
+
+region_ranef_2023 <- ranef(model_lmm)$regional_state |> 
+  tibble::rownames_to_column("regional_state") |> 
+  dplyr::rename(region_intercept = `(Intercept)`, region_slope = year_c) |> 
+  dplyr::mutate(region_effect_2023 = region_intercept + region_slope * year_c_2023) |> 
+  dplyr::select(regional_state, region_effect_2023)
+
+# Stations_id -> regional_state lookup, needed to attach each station's
+# region effect alongside its own station-level intercept.
+station_region <- illu |> 
+  dplyr::distinct(Stations_id, regional_state) |> 
+  dplyr::mutate(Stations_id = as.character(Stations_id))
+
+station_ranef_map <- ranef(model_lmm)$Stations_id |> 
+  tibble::rownames_to_column("Stations_id") |> 
+  dplyr::rename(station_intercept = `(Intercept)`) |> 
+  dplyr::left_join(station_region, by = "Stations_id") |> 
+  dplyr::left_join(region_ranef_2023, by = "regional_state") |> 
+  dplyr::mutate(
+    Stations_id = as.double(Stations_id),
+    combined_effect_2023 = station_intercept + region_effect_2023
+  )
+
+# One point per station: sugarbeet.phenology_sf has one row per
+# station-year, so take the distinct station/geometry combination and join
+# on the combined station + region effect.
+station_points_sf <- sugarbeet.phenology_sf |> 
+  dplyr::distinct(Stations_id, geometry) |> 
+  sf::st_as_sf() |> 
+  dplyr::inner_join(station_ranef_map, by = "Stations_id")
+
+plot_germany_ranef <- ggplot() +
+  theme_minimal() +
+  geom_sf(data = germany_sf, fill = "white") +
+  geom_sf(data = bundeslaender_sf, fill = NA, colour = "grey70", linewidth = 0.2) +
+  geom_sf(data = station_points_sf, aes(colour = combined_effect_2023), size = 1, alpha = 1,) +
+  scale_colour_gradient2(low = "#B2182B", mid = "white", high = "#2166AC", midpoint = 0) +
+  labs(
+    colour = "Station + region\neffect in 2023 (days)",
+    title = "Combined station + regional deviation from the population-level trend (2023)"
+  ) +
+  NULL
+
+plot_germany_ranef
+
+```
+
+```{r SowingDate_Germany_Interpolated}
+
+
+station_points_m <- sf::st_transform(station_points_sf, 25832)
+germany_sf_m <- sf::st_transform(germany_sf, 25832)
+bundeslaender_sf_m <- sf::st_transform(bundeslaender_sf, 25832)
+
+station_df <- station_points_m |>
+  sf::st_drop_geometry() |>
+  dplyr::bind_cols(as.data.frame(sf::st_coordinates(station_points_m)))
+
+gam_fit <- mgcv::gam(combined_effect_2023 ~ s(X, Y, k = 150), data = station_df, method = "REML")
+
+# Prediction grid: 1km centres (bumped up from 5km for a visibly smoother
+# raster/render), restricted to points that actually fall inside Germany's
+# outline (so nothing is interpolated offshore or across the border).
+grid_sf <- sf::st_make_grid(germany_sf_m, cellsize = 1000, what = "centers") |>
+  sf::st_as_sf() |>
+  sf::st_filter(germany_sf_m)
+
+grid_interp_df <- as.data.frame(sf::st_coordinates(grid_sf))
+grid_interp_df$combined_effect_2023 <- predict(gam_fit, newdata = grid_interp_df)
+
+# Unlike IDW, a GAM smoother extrapolates everywhere by default, so
+# distance-to-nearest-station has to be masked out manually: grid cells
+# more than 15km from any reporting station (e.g. the North Frisian
+# islands, or sparse stretches near the Bodensee/borders) get dropped
+# rather than showing an extrapolated value, so those areas stay blank
+# on the map instead of showing made-up values.
+nearest_station_idx <- sf::st_nearest_feature(grid_sf, station_points_m)
+grid_interp_df$dist_to_station <- as.numeric(
+  sf::st_distance(grid_sf, station_points_m[nearest_station_idx, ], by_element = TRUE)
+)
+
+# grid_interp_df <- grid_interp_df |> dplyr::filter(dist_to_station <= 10000)
+
+# True elevation contours (not contours of the fitted effect itself) let
+# us check whether the "earlier sowing" ridges visually line up with real
+# valleys (Rhine/Main/Danube) and uplands (e.g. the Harz), rather than just
+# tracing the smoothed surface's own isolines. `geodata::elevation_30s()`
+# pulls ~1km-resolution SRTM elevation for the country; reproject/crop/mask
+# it to the same metric CRS and outline used for the effect surface.
+elev <- geodata::elevation_30s(country = "DEU", path = tempdir())
+elev_m <- elev |>
+  terra::project("EPSG:25832") |>
+  terra::crop(terra::vect(germany_sf_m)) |>
+  terra::mask(terra::vect(germany_sf_m))
+
+elev_df <- as.data.frame(elev_m, xy = TRUE)
+names(elev_df) <- c("X", "Y", "elevation")
+
+plot_germany_ranef_interp <- ggplot() +
+  theme_minimal() +
+  geom_sf(data = germany_sf_m, fill = "grey") +
+  geom_tile(data = grid_interp_df, aes(x = X, y = Y, fill = combined_effect_2023)) +
+  geom_contour(
+    data = elev_df,
+    aes(x = X, y = Y, z = elevation),
+    colour = "grey20", linewidth = 0.15, alpha = 0.5, binwidth = 250
+  ) +
+  geom_sf(data = bundeslaender_sf_m, fill = NA, colour = "grey40", linewidth = 0.2) +
+  scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC", midpoint = 0) +
+  labs(
+    fill = "Station + region\neffect in 2023 (days)",
+    title = "Smoothed sowing-date effect with true elevation contours (200m)",
+    x = "",
+    y = ""
+  ) +
+  NULL
+
+plot_germany_ranef_interp
+
+```
+
+```{r SowingDate_Germany_Interpolated_Rayshader}
+
+
+bbox_m <- sf::st_bbox(germany_sf_m)
+bbox_m[c("xmin", "ymin")] <- bbox_m[c("xmin", "ymin")] - 50000
+bbox_m[c("xmax", "ymax")] <- bbox_m[c("xmax", "ymax")] + 50000
+
+
+grid_full_sf <- sf::st_make_grid(sf::st_as_sfc(bbox_m), cellsize = 1000, what = "centers") |>
+  sf::st_as_sf()
+grid_full_df <- as.data.frame(sf::st_coordinates(grid_full_sf))
+
+# legend.position = "none" is baked directly into gg_color itself here
+# (matching gg_height below), rather than relying on a "+ theme(...)"
+# tacked on wherever gg_color gets passed to plot_gg(). gg_color_legend,
+# defined further down right before the standalone cowplot legend, is the
+# one place that adds the legend back.
+gg_color <- ggplot() +
+  geom_tile(data = grid_full_df, aes(x = X, y = Y), fill = "grey50") +
+  geom_tile(data = grid_interp_df, aes(x = X, y = Y, fill = combined_effect_2023)) +
+  scale_fill_gradient2(low = "#B2182B", mid = "white", high = "#2166AC", midpoint = 0) +
+  coord_equal(xlim = bbox_m[c("xmin", "xmax")], ylim = bbox_m[c("ymin", "ymax")], expand = FALSE) +
+  theme_void() +
+  theme(legend.position = "none") +
+  labs(fill = "Deviation from the national mean (days)")
+
+
+neighbour_countries <- c("DEU", "NLD", "BEL", "LUX", "FRA", "CHE", "AUT", "CZE", "POL", "DNK")
+elev_tiles <- lapply(neighbour_countries, function(cc) {
+  geodata::elevation_30s(country = cc, path = tempdir(), mask = FALSE)
+})
+elev_mosaic <- do.call(terra::merge, elev_tiles)
+
+elev_bbox_m <- elev_mosaic |>
+  terra::project("EPSG:25832") |>
+  terra::crop(terra::ext(bbox_m[c("xmin", "xmax", "ymin", "ymax")]))
+
+
+# The only NAs left at this point are real gaps in the SRTM tiles -- just
+# the North Sea/Baltic coastline in the north of the bbox, where sea level
+# (0m) is a reasonable fill rather than an arbitrary one.
+elev_bbox_m[is.na(elev_bbox_m)] <- 0
+
+elev_bbox_df <- as.data.frame(elev_bbox_m, xy = TRUE)
+names(elev_bbox_df) <- c("X", "Y", "elevation")
+
+# Height ggplot: fill colour itself doesn't matter (plot_gg re-derives a
+# greyscale height map from the underlying data values/scale), but a
+# scale needs to be present so plot_gg can detect which aesthetic to use.
+gg_height <- ggplot(elev_bbox_df, aes(x = X, y = Y, fill = elevation)) +
+  geom_raster() +
+  scale_fill_gradient(low = "black", high = "white") +
+  coord_equal(xlim = bbox_m[c("xmin", "xmax")], ylim = bbox_m[c("ymin", "ymax")], expand = FALSE) +
+  theme_void() +
+  theme(legend.position = "none")
+
+
+rayshader::plot_gg(shadow_intensity = 0.6,
+  gg_color,
+  ggobj_height = gg_height,
+  width = 5, height = 6.5,
+  scale = 200,
+  multicore = TRUE,
+  windowsize = c(800, 1000),
+  zoom = 0.55, phi = 90, theta = 0,
+  raytrace = TRUE, sunangle = 260
+)
+
+# render_snapshot() has no "return the image, don't display it" mode --
+# passing a filename just saves a PNG instead of plotting to a device, so
+# that's used to get the render into an R object: save to a temp PNG, then
+# read it back in with png::readPNG() as a plain height x width x RGB
+# array, which annotation_raster() below can drop straight into a ggplot.
+snapshot_path <- tempfile(fileext = ".png")
+rayshader::render_snapshot(filename = snapshot_path)
+rgl::close3d()
+snapshot_img <- png::readPNG(snapshot_path)
+
+# coord_fixed(expand = FALSE) with xlim/ylim set to the image's own pixel
+# dimensions keeps annotation_raster() filling the whole panel edge to
+# edge (in image pixel units) rather than leaving ggplot's usual default
+# expansion/margins around it.
+gg_snapshot <- ggplot() +
+  annotation_raster(snapshot_img, xmin = 0, xmax = ncol(snapshot_img), ymin = 0, ymax = nrow(snapshot_img)) +
+  coord_fixed(xlim = c(0 + 36, ncol(snapshot_img) - 36), ylim = c(0 + 10, nrow(snapshot_img) - 10), expand = FALSE) +
+  theme_void() +
+  theme(plot.margin = margin(10, 10, 10, 10))
+
+# Legend as a patchwork inset, since gg_color itself has legend.position =
+# "none" (needed so plot_gg() doesn't bake a colour bar into the terrain
+# texture) and so isn't shown in the 3D render above. gg_color_legend on
+# its own is still the *whole map* with a legend attached (just not
+# suppressed) -- inset_element() would draw that entire small map on top
+# of the big one. What's actually wanted is just the legend key itself:
+# cowplot::get_legend() pulls that one grob out, and cowplot::ggdraw()
+# wraps it back into a plain ggplot so inset_element() has something it
+# can position. A translucent white background box behind it keeps the
+# numbers legible against the terrain underneath. inset_element()'s
+# left/bottom/right/top are fractions (0-1) of gg_snapshot's panel, so
+# this sits in the upper-right corner.
+gg_color_legend <- gg_color +
+  theme(
+    text = element_text(family = "Helvetica Neue"),
+    legend.position = "right",
+    legend.background = element_blank(),
+    legend.text = element_text(colour = "white", size = 12),
+    legend.title = element_text(colour = "white", size = 12, vjust = 2.8),
+    legend.key.spacing.y = margin(t = 1, unit = "lines"),
+    legend.margin = margin(6, 8, 6, 8)
+  )
+gg_legend_only <- cowplot::ggdraw(cowplot::get_legend(gg_color_legend))
+
+plot_ <- gg_snapshot +
+  patchwork::inset_element(gg_legend_only, left = -0.12, bottom = 0.62, right = 0.98, top = 1.08) +
+  patchwork::plot_annotation(title = "Spatial variation in sugar beet sowing date",
+                             caption = "Deutscher Wetterdienst (DWD), Climate Data Center (CDC):
+                             Phenological observations of crops from sowing to harvest
+                             (annual reporters, historical), Version v010, 2024.
+                             
+    Till Rose") &
+  theme(title = element_text(colour = "black", size = 13, vjust = 6, family = "Helvetica Neue"),
+        caption = element_text(colour = "black", size = 10, vjust = 6, family = "Helvetica Neue"))
+
+
+plot_
+
+```
+
+```{r SowingDateEarlier_RegionalState, fig.asp = 1}
+
+state_to_region <- tibble::tribble(
+  ~state,                          ~regional_state,
+  "Schleswig-Holstein",            "Schleswig-Holstein und Hamburg",
+  "Hamburg",                       "Schleswig-Holstein und Hamburg",
+  "Niedersachsen",                 "Niedersachsen und Bremen",
+  "Bremen",                        "Niedersachsen und Bremen",
+  "Nordrhein-Westfalen",           "Nordrhein-Westfalen",
+  "Hessen",                        "Hessen",
+  "Rheinland-Pfalz",               "Rheinland-Pfalz und Saarland",
+  "Saarland",                      "Rheinland-Pfalz und Saarland",
+  "Baden-Württemberg",             "Baden-Württemberg",
+  "Bayern",                        "Bayern",
+  "Berlin",                        "Brandenburg und Berlin",
+  "Brandenburg",                   "Brandenburg und Berlin",
+  "Mecklenburg-Vorpommern",        "Mecklenburg-Vorpommern",
+  "Sachsen",                       "Sachsen",
+  "Sachsen-Anhalt",                "Sachsen-Anhalt",
+  "Thüringen",                     "Thüringen"
+)
+
+# Dissolve the individual-state polygons into the 12 model regions.
+region_sf <- bundeslaender_sf |>
+  dplyr::rename(state = regional_state) |>
+  dplyr::left_join(state_to_region, by = "state") |>
+  dplyr::group_by(regional_state) |>
+  dplyr::summarise(geometry = sf::st_union(geometry)) |>
+  sf::st_as_sf()
+
+# Predicted (fixed spline shape + region random intercept/slope, station
+# effect held at population level) sowing DOY per region at the earliest
+# available year (1951; the data doesn't go back to 1950) and the reference
+# year (2023), avoiding extrapolation beyond the data range. The
+# difference is how many days earlier sowing is "now" vs. then -- positive
+# means earlier.
+year_c_1951 <- min(illu$year_c)
+year_c_2023 <- 2023 - 1987
+
+pred_earlier <- expand.grid(
+  year_c = c(year_c_1951, year_c_2023),
+  regional_state = unique(illu$regional_state)
+)
+pred_earlier$predicted <- predict(model_lmm, newdata = pred_earlier, re.form = ~ (1 + year_c | regional_state))
+
+region_earlier <- pred_earlier |>
+  dplyr::mutate(when = ifelse(year_c == year_c_1951, "then", "now")) |>
+  dplyr::select(regional_state, when, predicted) |>
+  tidyr::pivot_wider(names_from = when, values_from = predicted) |>
+  dplyr::mutate(days_earlier = then - now)
+
+region_sf <- region_sf |>
+  dplyr::left_join(region_earlier, by = "regional_state") |>
+  # st_point_on_surface() only guarantees a point that lies inside the
+  # polygon (typically the vertex of a triangulation nearest the
+  # centroid) -- it isn't the region's actual center of mass. st_centroid()
+  # is that area-weighted centre of gravity instead; checked separately
+  # that it still lands inside all 12 (dissolved, occasionally concave)
+  # regions here, so there's no need for st_point_on_surface()'s
+  # inside-guarantee as a fallback.
+  dplyr::mutate(label_point = sf::st_centroid(geometry)) |> 
+  st_transform(crs = 25832)
+
+# Pad the panel by 50km on every side so the map doesn't butt right up
+# against Germany's own outline. region_sf is already in the metric
+# EPSG:25832 CRS, so st_bbox() is in metres and can be padded directly;
+# coord_sf(expand = FALSE) then uses that padded bbox as-is instead of
+# adding ggplot's own (multiplicative, not a fixed distance) default
+# expansion on top.
+region_bbox <- sf::st_bbox(region_sf)
+
+plot_days_earlier <- ggplot(region_sf) +
+  theme_minimal(base_size = 13) +
+  theme(text = element_text(family = "Helvetica Neue"),
+        legend.background = element_blank(),
+        legend.position = c(0, 1),
+        legend.justification = c(0, 1)) +
+  geom_sf(aes(fill = days_earlier)) +
+  geom_sf_text(aes(geometry = label_point, label = sprintf("%.0f", days_earlier)), size = 4.5, family = "Helvetica Neue", colour = "grey20") +
+  scale_fill_viridis_c(option = "cividis", begin = 0.5) +
+  coord_sf(
+    xlim = region_bbox[c("xmin", "xmax")] + c(-75000, 10000),
+    ylim = region_bbox[c("ymin", "ymax")] + c(-65000, 75000),
+    expand = FALSE
+  ) +
+  labs(
+    fill = "Estimated advance (days)\n1951–2023",
+    title = "Temporal change in sugar beet sowing date",
+    x = "",
+    y = "",
+    caption = "Deutscher Wetterdienst (DWD), Climate Data Center (CDC):
+                             Phenological observations of crops from sowing to harvest
+                             (annual reporters, historical), Version v010, 2024.
+                             
+    Till Rose"
+  ) +
+  NULL
+
+plot_days_earlier
+
+```
+
+
+```{r SowingDate_Trend_Diagnostics}
+
+# Formal comparison of fixed-effect structures (all refit with ML so
+# log-likelihoods/AIC are comparable; REML is only appropriate once the
+# fixed-effect structure is fixed): plain linear, shared spline only,
+# region-specific linear slopes as a *fixed* interaction, and the same
+# regional effect as a *random* slope + intercept (model_lmm as used
+# above).
+model_lmm_linear_ml <- lmer(
+  doy ~ Referenzjahr + (1 | Stations_id),
+  data = illu,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+model_lmm_spline_ml <- lmer(
+  doy ~ splines::bs(year_c, df = 5) + (1 | Stations_id),
+  data = illu,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+model_lmm_region_fixed_ml <- lmer(
+  doy ~ splines::bs(year_c, df = 5) + year_c:regional_state + (1 | Stations_id),
+  data = illu,
+  REML = FALSE,
+  control = lmerControl(optimizer = "bobyqa")
+)
+model_lmm_region_random_ml <- update(model_lmm, REML = FALSE)
+
+AIC(model_lmm_linear_ml, model_lmm_spline_ml, model_lmm_region_fixed_ml, model_lmm_region_random_ml)
+
+anova(model_lmm_linear_ml, model_lmm_spline_ml)
+anova(model_lmm_spline_ml, model_lmm_region_fixed_ml)
+
+
+aug <- broom.mixed::augment(model_lmm) |> 
+  dplyr::mutate(Referenzjahr = illu$Referenzjahr)
+
+plot_resid_fitted <- ggplot(aug, aes(x = .fitted, y = .resid)) +
+  theme_bw() +
+  geom_point(alpha = 0.1) +
+  geom_hline(yintercept = 0, color = "red") +
+  geom_smooth(se = FALSE, color = "blue") +
+  labs(x = "Fitted", y = "Residual", title = "Residuals vs fitted")
+
+plot_resid_fitted
+
+plot_scale_location <- ggplot(aug, aes(x = .fitted, y = sqrt(abs(.resid)))) +
+  theme_bw() +
+  geom_point(alpha = 0.1) +
+  geom_smooth(se = FALSE, color = "blue") +
+  labs(x = "Fitted", y = expression(sqrt("|Residual|")), title = "Scale-location")
+
+plot_scale_location
+
+plot_qq_resid <- ggplot(aug, aes(sample = .resid)) +
+  theme_bw() +
+  stat_qq(alpha = 0.2) +
+  stat_qq_line(color = "red") +
+  labs(title = "Q-Q plot of residuals")
+
+plot_qq_resid
+
+# Normality of the station random intercepts (BLUPs)
+station_ranef <- ranef(model_lmm)$Stations_id
+
+plot_qq_ranef <- ggplot(station_ranef, aes(sample = `(Intercept)`)) +
+  theme_bw() +
+  stat_qq(alpha = 0.3) +
+  stat_qq_line(color = "red") +
+  labs(title = "Q-Q plot of station random intercepts")
+
+plot_qq_ranef
+
+# Residuals vs Referenzjahr: checks whether a linear trend is an adequate
+# fit, or whether the true relationship is curved over time. A smooth with
+# no systematic pattern around zero supports the linearity assumption.
+plot_resid_year <- ggplot(aug, aes(x = Referenzjahr, y = .resid)) +
+  theme_bw() +
+  geom_point(alpha = 0.1) +
+  geom_hline(yintercept = 0, color = "red") +
+  geom_smooth(se = FALSE, color = "blue") +
+  labs(x = "Referenzjahr", y = "Residual", title = "Residuals vs Referenzjahr")
+
+plot_resid_year
+
+
+plot_resid_year_by_region <- aug |> 
+  dplyr::mutate(regional_state = illu$regional_state) |> 
+  ggplot(aes(x = Referenzjahr, y = .resid)) +
+  theme_bw() +
+  geom_point(alpha = 0.08) +
+  geom_hline(yintercept = 0, color = "red") +
+  geom_smooth(se = FALSE, color = "blue", method = "loess") +
+  facet_wrap(~ regional_state) +
+  labs(x = "Referenzjahr", y = "Residual",
+       title = "Residuals vs Referenzjahr by region (all stations pooled)")
+
+# Pooled by region, the earlier mid-century dip / later-rise wobble mostly
+# disappears -- most regions show residuals scattered flatly around zero.
+
+plot_resid_year_by_region
+
+
+
+
+top_stations <- c("7923", "8064", "8285", "8606", "10176",
+                   "10619", "11174", "11220", "11725", "11803")
+
+plot_resid_year_top_stations_pooled <- aug |> 
+  dplyr::filter(Stations_id %in% top_stations) |> 
+  ggplot(aes(x = Referenzjahr, y = .resid)) +
+  theme_bw() +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, color = "red") +
+  geom_smooth(se = FALSE, color = "blue", method = "loess") +
+  labs(x = "Referenzjahr", y = "Residual",
+       title = "Residuals vs Referenzjahr, 10 longest-running stations pooled (not faceted)")
+
+
+
+plot_resid_year_top_stations_pooled
+
+```
