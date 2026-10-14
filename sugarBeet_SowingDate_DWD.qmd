@@ -11,6 +11,8 @@ library("sf")
 library("rnaturalearth")
 library("lme4")
 library("lmerTest")
+library("broom")
+library("broom.mixed")
 
 ```
 
@@ -74,7 +76,7 @@ sugarbeet.phenology_sf <- sugarbeet.phenology_sf |>
 
 illu_points <- sugarbeet.phenology_sf  |> 
   st_transform(crs = 25832) |> 
-  mutate(recent = ifelse(Referenzjahr == 2025, "Yes", "No"))
+  mutate(recent = ifelse(Referenzjahr == 2023, "Yes", "No"))
 
 plot_ <- ggplot(illu_points) + 
   theme_minimal(base_size = 13) +
@@ -88,7 +90,7 @@ plot_ <- ggplot(illu_points) +
   scale_fill_viridis_c(option = "turbo") +
   scale_size_manual(values = c(2, 4)) +
   labs(fill = "Observation year",
-       size = "Recent observation (2025)",
+       size = "Recent observation (2023)",
        caption = "Deutscher Wetterdienst (DWD), Climate Data Center (CDC):
                              Phenological observations of crops from sowing to harvest
                              (annual reporters, historical), Version v010, 2024.
